@@ -9,6 +9,9 @@
   <!-- PDF Export: html2canvas + jsPDF -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+  <!-- Firebase (多人即時同步) -->
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
   <!-- Google Fonts: Inter & JetBrains Mono for scores -->
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -222,6 +225,12 @@
           即時計分板
         </button>
       </div>
+
+      <!-- 多人同步狀態 -->
+      <button onclick="openSyncModal()" class="flex items-center justify-center gap-2 bg-slate-950/60 border border-slate-800 hover:border-emerald-500/50 px-3 py-2 rounded-xl text-xs font-bold text-slate-300 hover:text-white transition-all self-stretch sm:self-auto">
+        <span id="sync-dot" class="w-2 h-2 rounded-full bg-slate-600"></span>
+        <span id="sync-status-label">未連線</span>
+      </button>
     </div>
   </header>
 
@@ -855,6 +864,20 @@
     </div>
   </div>
 
+  <!-- MODAL: SYNC / ROOM (多人即時同步) -->
+  <div id="sync-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-md overflow-hidden shadow-2xl">
+      <div class="p-6 border-b border-slate-800 flex justify-between items-start">
+        <div>
+          <h3 class="text-lg font-black text-white">🌐 多人即時同步</h3>
+          <p class="text-xs text-slate-400 mt-1">同一房間的所有人都會即時看到最新賽程與比分</p>
+        </div>
+        <button onclick="closeSyncModal()" class="text-slate-400 hover:text-white text-lg font-bold">✕</button>
+      </div>
+      <div id="sync-modal-content" class="p-6"></div>
+    </div>
+  </div>
+
   <!-- MODAL: DYNAMIC CONFIRMATION MODAL -->
   <div id="confirm-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 hidden">
     <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-xs overflow-hidden shadow-2xl p-6 text-center space-y-4">
@@ -901,6 +924,7 @@
       AppState.tournament.rawUnseeded = presetUnseeded16.slice(0, 4).join("\n");
       buildTournamentBracket();
       switchTab('tournament');
+      Sync.init();
     }
 
     // Tab switcher (四分頁: 單淘汰 / 大循環 / 團體賽 / 計分板)
@@ -1316,7 +1340,7 @@
                   </button>
                 </div>
               ` : (match.status === 'completed' && match.scoreSummary !== '輪空晉級' ? `
-                <span class="text-[10px] text-emerald-500 font-semibold truncate max-w-full">比數: ${match.scoreSummary}</span>
+                <button onclick="confirmClearKO('${match.id}')" class="text-[10px] text-emerald-500 hover:text-white font-semibold truncate max-w-full transition-colors" title="修改本場成績">比數: ${match.scoreSummary} ✏️</button>
               ` : `
                 <span class="text-[10px] text-slate-500 py-0.5 italic truncate max-w-full">${(isP1Bye || isP2Bye) ? "免戰直接晉級" : "等待上一輪"}</span>
               `)}
@@ -2012,6 +2036,7 @@
           sb.teamMatchId = null;
         }
         switchTab(backTab);
+        schedulePush();
       });
     }
 
@@ -2019,7 +2044,44 @@
       showConfirmationModal("重組賽事確認", "重建賽事會清空目前所有對決戰績與晉級狀況。確定要重建嗎？", "重建賽局", () => {
         buildTournamentBracket();
         renderTournament();
+        schedulePush();
       });
+    }
+
+    // 修改單淘汰已完成場次的成績（會連帶清除後續受影響輪次）
+    function confirmClearKO(matchId) {
+      showConfirmationModal("修改本場成績", "將清除本場成績，以及後續輪次中受本場勝方影響的成績，清除後即可重新輸入。確定要修改嗎？", "清除並修改", () => {
+        clearKOResult(matchId);
+        schedulePush();
+      });
+    }
+
+    function clearKOResult(matchId) {
+      const found = findTournamentMatch(matchId);
+      if (!found) return;
+      clearKOChain(found.rIdx, found.mIdx);
+      cascadeByesAndWalkovers(); // 恢復輪空自動晉級
+      renderTournament();
+    }
+
+    function clearKOChain(rIdx, mIdx) {
+      const rounds = AppState.tournament.rounds;
+      const m = rounds[rIdx][mIdx];
+      m.p1Games = 0; m.p2Games = 0; m.winner = null; m.scoreSummary = ""; m.status = "scheduled";
+      const nr = rIdx + 1;
+      if (nr < rounds.length) {
+        const nmIdx = Math.floor(mIdx / 2);
+        const nm = rounds[nr][nmIdx];
+        const slot = mIdx % 2 === 0 ? 'player1' : 'player2';
+        if (nm[slot]) {
+          nm[slot] = null;
+          if (nm.status === 'completed' || nm.winner) {
+            clearKOChain(nr, nmIdx);
+          } else {
+            nm.status = 'scheduled';
+          }
+        }
+      }
     }
 
     // Save and feed match results directly to tournament tree with automatic bracket progression
@@ -2524,6 +2586,7 @@
           m.p1Games = 0; m.p2Games = 0; m.winner = null; m.status = "scheduled"; m.scoreSummary = "";
         });
         renderRoundRobin();
+        schedulePush();
       });
     }
     // ==================== END ROUND ROBIN ====================
@@ -2944,6 +3007,7 @@
         });
         AppState.team.lineupSet = false;
         renderTeam();
+        schedulePush();
       });
     }
 
@@ -2954,6 +3018,7 @@
           m.p1Games = 0; m.p2Games = 0; m.winner = null; m.status = "scheduled"; m.scoreSummary = "";
         });
         renderTeam();
+        schedulePush();
       });
     }
     // ==================== END TEAM MATCH ====================
@@ -3278,6 +3343,277 @@
       );
     }
     // ==================== END PDF EXPORT ====================
+
+    // ==================== REALTIME SYNC 多人即時同步 ====================
+    // ★★★ 設定方式（只需管理者做一次）★★★
+    // 1. 到 https://console.firebase.google.com 建立免費專案
+    // 2. 左側「建構 → Realtime Database」→ 建立資料庫 → 規則選「測試模式」
+    // 3. 專案總覽 → 齒輪「專案設定」→ 你的應用程式 → 新增「網頁」應用程式
+    // 4. 複製 firebaseConfig 內容，貼進下方 FIREBASE_CONFIG 的大括號中，重新上傳本檔案
+    const FIREBASE_CONFIG = {
+      apiKey: "AIzaSyBAcsHNN7rckwRQ6ZZYoSK86weowaD6uPU",
+      authDomain: "pingpong-tool-8127c.firebaseapp.com",
+      databaseURL: "https://pingpong-tool-8127c-default-rtdb.firebaseio.com",
+      projectId: "pingpong-tool-8127c",
+      storageBucket: "pingpong-tool-8127c.firebasestorage.app",
+      messagingSenderId: "243564877081",
+      appId: "1:243564877081:web:f8a5913c1808251407e188",
+      measurementId: "G-Y1ST3WJ0ZZ"
+    };
+
+    const Sync = {
+      db: null,
+      room: null,
+      clientId: Math.random().toString(36).slice(2, 10),
+      rev: 0,
+      applying: false,
+      pushTimer: null,
+      enabled() {
+        return typeof firebase !== 'undefined' && !!FIREBASE_CONFIG.databaseURL;
+      },
+      init() {
+        try {
+          if (!this.enabled()) { updateSyncUI(); return; }
+          firebase.initializeApp(FIREBASE_CONFIG);
+          this.db = firebase.database();
+          let hashRoom = null;
+          try { hashRoom = (location.hash.match(/room=([A-Za-z0-9_-]+)/) || [])[1] || null; } catch (e) {}
+          let saved = null;
+          try { saved = localStorage.getItem('tt-room'); } catch (e) {}
+          const room = hashRoom || saved;
+          if (room) this.join(room);
+        } catch (e) { console.log('sync init error', e); }
+        updateSyncUI();
+      },
+      join(code) {
+        code = (code || '').trim().toUpperCase().replace(/[^A-Z0-9_-]/g, '');
+        if (!code || !this.db) return;
+        if (this.room) this.db.ref('rooms/' + this.room).off();
+        this.room = code;
+        try { localStorage.setItem('tt-room', code); } catch (e) {}
+        try { history.replaceState(null, '', '#room=' + code); } catch (e) {}
+        const ref = this.db.ref('rooms/' + code);
+        ref.on('value', snap => {
+          const data = snap.val();
+          if (!data || data.clientId === this.clientId) return;
+          this.applyRemote(data);
+        }, err => {
+          console.log('sync listen error', err);
+          const label = document.getElementById('sync-status-label');
+          if (label) label.innerText = "同步失敗(檢查規則)";
+        });
+        ref.once('value').then(snap => {
+          if (!snap.exists()) this.push(); // 房間是新的 → 上傳目前本機狀態
+        });
+        updateSyncUI();
+      },
+      leave() {
+        if (this.room && this.db) this.db.ref('rooms/' + this.room).off();
+        this.room = null;
+        try { localStorage.removeItem('tt-room'); } catch (e) {}
+        try { history.replaceState(null, '', location.pathname + location.search); } catch (e) {}
+        updateSyncUI();
+      },
+      push() {
+        if (!this.db || !this.room || this.applying) return;
+        this.rev++;
+        const payload = {
+          clientId: this.clientId,
+          rev: this.rev,
+          ts: Date.now(),
+          state: JSON.stringify({
+            tournament: AppState.tournament,
+            roundrobin: AppState.roundrobin,
+            team: AppState.team,
+            bestOf: AppState.settings.bestOf
+          })
+        };
+        this.db.ref('rooms/' + this.room).set(payload).then(() => {
+          flashSyncStatus("已同步 ✓");
+        }).catch(err => {
+          console.log('sync push error', err);
+          const label = document.getElementById('sync-status-label');
+          if (label) label.innerText = "同步失敗(檢查規則)";
+        });
+      },
+      applyRemote(data) {
+        try {
+          this.applying = true;
+          this.rev = Math.max(this.rev, data.rev || 0);
+          const st = JSON.parse(data.state);
+          if (st.tournament) {
+            // 補齊 Firebase 可能省略的空陣列
+            st.tournament.rounds = (st.tournament.rounds || []).map(r => r || []);
+            AppState.tournament = st.tournament;
+          }
+          if (st.roundrobin) {
+            st.roundrobin.players = st.roundrobin.players || [];
+            st.roundrobin.matches = st.roundrobin.matches || [];
+            AppState.roundrobin = st.roundrobin;
+          }
+          if (st.team) {
+            st.team.format = st.team.format || [];
+            st.team.matches = st.team.matches || [];
+            st.team.lineupA = st.team.lineupA || [];
+            st.team.lineupB = st.team.lineupB || [];
+            st.team.teamA = st.team.teamA || { name: "甲隊", players: [] };
+            st.team.teamB = st.team.teamB || { name: "乙隊", players: [] };
+            st.team.teamA.players = st.team.teamA.players || [];
+            st.team.teamB.players = st.team.teamB.players || [];
+            AppState.team = st.team;
+          }
+          if (st.bestOf) {
+            AppState.settings.bestOf = st.bestOf;
+            const sel = document.getElementById('match-rule-select');
+            if (sel) sel.value = String(st.bestOf);
+          }
+          if (AppState.activeTab === 'tournament') renderTournament();
+          else if (AppState.activeTab === 'roundrobin') renderRoundRobin();
+          else if (AppState.activeTab === 'team') renderTeam();
+          flashSyncStatus("已更新 ↓");
+        } catch (e) {
+          console.log('sync apply error', e);
+        } finally {
+          this.applying = false;
+        }
+      }
+    };
+
+    function schedulePush() {
+      if (!Sync.db || !Sync.room || Sync.applying) return;
+      clearTimeout(Sync.pushTimer);
+      Sync.pushTimer = setTimeout(() => Sync.push(), 250);
+    }
+
+    function updateSyncUI() {
+      const dot = document.getElementById('sync-dot');
+      const label = document.getElementById('sync-status-label');
+      if (!dot || !label) return;
+      if (!Sync.enabled()) {
+        dot.className = "w-2 h-2 rounded-full bg-amber-400";
+        label.innerText = "同步未設定";
+      } else if (Sync.room) {
+        dot.className = "w-2 h-2 rounded-full bg-emerald-400 animate-pulse";
+        label.innerText = "房間 " + Sync.room;
+      } else {
+        dot.className = "w-2 h-2 rounded-full bg-slate-600";
+        label.innerText = "未連線";
+      }
+    }
+
+    let flashTimer = null;
+    function flashSyncStatus(text) {
+      const label = document.getElementById('sync-status-label');
+      if (!label) return;
+      label.innerText = text;
+      clearTimeout(flashTimer);
+      flashTimer = setTimeout(updateSyncUI, 1500);
+    }
+
+    function openSyncModal() {
+      renderSyncModal();
+      document.getElementById('sync-modal').classList.remove('hidden');
+    }
+    function closeSyncModal() {
+      document.getElementById('sync-modal').classList.add('hidden');
+    }
+
+    function renderSyncModal() {
+      const box = document.getElementById('sync-modal-content');
+      if (!Sync.enabled()) {
+        box.innerHTML = `
+          <div class="space-y-3 text-sm text-slate-300 leading-relaxed">
+            <p class="text-amber-400 font-bold">⚠ 尚未設定雲端同步</p>
+            <p class="text-xs text-slate-400">即時多人同步需要一個免費的 Firebase 資料庫。由管理者設定一次即可，其他隊員完全不用設定：</p>
+            <ol class="text-xs text-slate-400 space-y-1.5 list-decimal list-inside">
+              <li>到 console.firebase.google.com 建立免費專案</li>
+              <li>建構 → Realtime Database → 建立資料庫 → 規則選「測試模式」</li>
+              <li>專案設定 → 新增「網頁」應用程式 → 複製 firebaseConfig</li>
+              <li>貼進 index.html 內的 FIREBASE_CONFIG 區塊後重新上傳 GitHub</li>
+            </ol>
+            <p class="text-[10px] text-slate-500">設定完成後重新整理本頁，即可建立房間讓全隊共用。</p>
+          </div>`;
+        return;
+      }
+      if (Sync.room) {
+        const link = location.origin + location.pathname + '#room=' + Sync.room;
+        box.innerHTML = `
+          <div class="space-y-4">
+            <div class="text-center">
+              <p class="text-xs text-slate-400 mb-1">目前房間代碼</p>
+              <p class="score-font text-3xl font-black text-emerald-400 tracking-widest">${Sync.room}</p>
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-xs text-slate-400 font-bold">分享此連結給隊員（開啟即自動加入）</label>
+              <div class="flex gap-2">
+                <input id="sync-share-link" type="text" readonly value="${link}" class="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-300 focus:outline-none">
+                <button onclick="copySyncLink()" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 px-4 py-2 rounded-lg text-xs font-black transition-all">複製</button>
+              </div>
+            </div>
+            <button onclick="Sync.leave(); renderSyncModal();" class="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700/80 text-slate-300 font-bold py-2.5 rounded-xl text-xs transition-all">離開房間（改回單機模式）</button>
+          </div>`;
+      } else {
+        box.innerHTML = `
+          <div class="space-y-4">
+            <div class="space-y-1.5">
+              <label class="text-xs text-slate-400 font-bold">輸入房間代碼（同隊使用相同代碼即可同步）</label>
+              <div class="flex gap-2">
+                <input id="sync-room-input" type="text" maxlength="12" placeholder="例如 TEAM01" class="flex-1 bg-slate-950 border border-slate-800 focus:border-emerald-500 rounded-lg px-3 py-2.5 text-sm text-white uppercase score-font tracking-widest focus:outline-none">
+                <button onclick="joinRoomFromInput()" class="bg-emerald-500 hover:bg-emerald-400 text-slate-950 px-5 py-2.5 rounded-lg text-sm font-black transition-all">加入</button>
+              </div>
+            </div>
+            <button onclick="createRandomRoom()" class="w-full bg-slate-800 hover:bg-slate-700 border border-slate-700/80 text-slate-300 font-bold py-2.5 rounded-xl text-xs transition-all">🎲 建立新房間（隨機代碼）</button>
+            <p class="text-[10px] text-slate-500">加入房間後，你目前的賽程會與房間內容同步；若房間是新的，會以你目前的賽程作為起始內容。</p>
+          </div>`;
+      }
+    }
+
+    function joinRoomFromInput() {
+      const v = document.getElementById('sync-room-input').value;
+      if (!v.trim()) return;
+      Sync.join(v);
+      renderSyncModal();
+    }
+
+    function createRandomRoom() {
+      const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+      let code = "";
+      for (let i = 0; i < 5; i++) code += chars[Math.floor(Math.random() * chars.length)];
+      Sync.join(code);
+      renderSyncModal();
+    }
+
+    function copySyncLink() {
+      const input = document.getElementById('sync-share-link');
+      input.select();
+      try {
+        if (navigator.clipboard) navigator.clipboard.writeText(input.value);
+        else document.execCommand('copy');
+        flashSyncStatus("已複製連結");
+      } catch (e) {}
+    }
+
+    // 自動在資料異動函式後推送同步（比賽確認、快速輸入、修改、排點、建立賽程等）
+    (function installSyncHooks() {
+      if (typeof window === 'undefined') return;
+      const hooked = [
+        'savePlayersAndBuildBracket', 'setKOQuickScore', 'saveAndCompleteMatch', 'changeBestOf',
+        'buildRoundRobin', 'setRRQuickScore', 'clearRRResult',
+        'buildTeamTie', 'confirmTeamLineup', 'setTeamQuickScore', 'clearTeamResult',
+        'launchUmpire', 'launchRRUmpire', 'launchTeamUmpire'
+      ];
+      hooked.forEach(name => {
+        const orig = window[name];
+        if (typeof orig === 'function') {
+          window[name] = function (...args) {
+            const r = orig.apply(this, args);
+            schedulePush();
+            return r;
+          };
+        }
+      });
+    })();
+    // ==================== END REALTIME SYNC ====================
 
     function openRulesModal() {
       document.getElementById('rules-modal').classList.remove('hidden');
